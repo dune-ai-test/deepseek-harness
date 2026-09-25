@@ -25,7 +25,7 @@ describe('CI workflow', () => {
     expect(steps[preparation]).not.toHaveProperty('continue-on-error', true)
   })
 
-  it.each(['ci.yml', 'ci-master.yml', 'e2e.yml', 'release.yml', 'release-vendor.yml'])(
+  it.each(['build-windows-app.yml', 'ci.yml', 'ci-master.yml', 'e2e.yml', 'release.yml', 'release-vendor.yml'])(
     '%s cancels superseded validation runs without crossing workflow or ref boundaries', (name) => {
       const workflow = loadWorkflow('.github/workflows/' + name)
       expect(workflow.concurrency).toEqual({
@@ -34,6 +34,67 @@ describe('CI workflow', () => {
       })
     },
   )
+
+  it('publishes only a verified unsigned Windows installer through a draft release', () => {
+    const workflow = loadWorkflow('.github/workflows/build-windows-app.yml')
+    expect(workflow.on).toMatchObject({
+      workflow_dispatch: {
+        inputs: {
+          build_version: { required: false, type: 'string' },
+          release_tag: { required: false, type: 'string' },
+        },
+      },
+      push: { branches: ['master'] },
+    })
+    expect(workflow.permissions).toEqual({ contents: 'write' })
+
+    const job = workflowJob(workflow, 'build')
+    expect(job).toMatchObject({
+      'runs-on': 'windows-2025',
+      'timeout-minutes': 120,
+      defaults: { run: { shell: 'pwsh' } },
+    })
+    if (!Array.isArray(job.steps)) throw new TypeError('Windows app build job must define steps')
+    const steps = job.steps.filter(isRecord)
+    const stepIndex = (name: string): number => steps.findIndex(step => step.name === name)
+    const install = stepIndex('Install (immutable)')
+    const workflowPolicy = stepIndex('Validate workflow policy and Desktop documentation')
+    const packageInstaller = stepIndex('Build unsigned Windows installer')
+    const verify = stepIndex('Verify and hash installer')
+    const createDraft = stepIndex('Create draft GitHub Release')
+    const upload = stepIndex('Upload installer to draft GitHub Release')
+    const publish = stepIndex('Publish GitHub Release')
+    const cleanup = stepIndex('Remove temporary Desktop configuration')
+
+    expect(steps).toContainEqual(expect.objectContaining({
+      uses: 'pnpm/action-setup@v4',
+      with: { dest: nativeWindowsPnpmDestination },
+    }))
+    expect(install).toBeGreaterThanOrEqual(0)
+    expect(workflowPolicy).toBeGreaterThan(install)
+    expect(packageInstaller).toBeGreaterThan(workflowPolicy)
+    expect(verify).toBeGreaterThan(packageInstaller)
+    expect(createDraft).toBeGreaterThan(verify)
+    expect(upload).toBeGreaterThan(createDraft)
+    expect(publish).toBeGreaterThan(upload)
+    expect(cleanup).toBeGreaterThan(publish)
+    expect(steps[workflowPolicy]).toMatchObject({
+      run: [
+        'pnpm exec vitest run scripts/ci-workflow.spec.ts',
+        'pnpm run verify-translation-pairing apps/desktop/README.md',
+      ].join('\n'),
+    })
+    expect(steps[packageInstaller].run).toContain('pnpm run package:desktop:win:x64:unsigned')
+    expect(steps[packageInstaller].run).toContain('--build-version "$env:BUILD_VERSION"')
+    expect(steps[verify].run).toContain('Get-AuthenticodeSignature')
+    expect(steps[verify].run).toContain("if ($signature.Status -ne 'NotSigned')")
+    expect(steps[createDraft].run).toContain('gh release create $env:RELEASE_TAG')
+    expect(steps[createDraft].run).toContain('--latest=false')
+    expect(steps[upload].run).toContain('gh release upload $env:RELEASE_TAG')
+    expect(steps[publish].run).toContain('gh release edit $env:RELEASE_TAG --draft=false --prerelease')
+    expect(steps[cleanup]).toMatchObject({ if: 'always()' })
+    expect(steps.some(step => typeof step.uses === 'string' && step.uses.startsWith('actions/upload-artifact@'))).toBe(false)
+  })
 
   it('cancels reusable CI builds without cancelling release-owned builds', () => {
     const workflow = loadWorkflow('.github/workflows/build-exe-for-python-sdk.yml')

@@ -1,0 +1,181 @@
+name: Build Windows app
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_version:
+        description: Optional approved test version; blank uses the Desktop manifest version
+        required: false
+        default: ''
+        type: string
+      release_tag:
+        description: Optional release tag; blank generates a unique tag for this run
+        required: false
+        default: ''
+        type: string
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  build:
+    name: unsigned installer
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          clean: true
+          persist-credentials: false
+
+      - name: Enable Developer Mode (symlink support)
+        run: >-
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
+          /t REG_DWORD /f /v "AllowDevelopmentWithoutDevLicense" /d "1"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-js-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.10'
+
+      - name: Install (immutable)
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate workflow policy and Desktop documentation
+        run: |
+          pnpm exec vitest run scripts/ci-workflow.spec.ts
+          pnpm run verify-translation-pairing apps/desktop/README.md
+
+      - name: Resolve application version and release tag
+        id: version
+        env:
+          REQUESTED_BUILD_VERSION: ${{ inputs.build_version }}
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $version = $env:REQUESTED_BUILD_VERSION
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $version = (Get-Content apps/desktop/package.json -Raw | ConvertFrom-Json).version
+          }
+          if ([string]::IsNullOrWhiteSpace($version)) { throw 'Desktop manifest version is empty' }
+
+          $tag = $env:REQUESTED_RELEASE_TAG
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+            $tag = "windows-v$version-$env:GITHUB_RUN_NUMBER-$shortSha-$env:GITHUB_RUN_ATTEMPT"
+          }
+          if ($tag -notmatch '^[A-Za-z0-9._-]+$') { throw "Invalid release tag: $tag" }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Configure unsigned packaging
+        run: |
+          @'
+          DSH_DESKTOP_APP_ID=com.deepseek.harness
+          DSH_DESKTOP_AUTO_UPDATE_ENV=test
+          DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://policy.example.invalid
+          DSH_DESKTOP_MANDATORY_UPDATE_CONFIG='{"allowedAuthOrigins":["https://login.example.invalid"]}'
+          '@ | Set-Content -LiteralPath apps/desktop/.env.windows -Encoding utf8NoBOM
+
+      - name: Build unsigned Windows installer
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          pnpm run package:desktop:win:x64:unsigned
+          -- --build-version "$env:BUILD_VERSION"
+
+      - name: Verify and hash installer
+        id: artifact
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $version = $env:BUILD_VERSION
+          $output = 'apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts'
+          $filename = "deepseek-harness-${version}-win-x64-unsigned.exe"
+          $installer = "$output/$filename"
+          $blockmap = "$installer.blockmap"
+          $hashes = "$output/SHA256SUMS"
+
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Unsigned installer is missing: $installer"
+          }
+          if (-not (Test-Path -LiteralPath $blockmap -PathType Leaf)) {
+            throw "Installer blockmap is missing: $blockmap"
+          }
+          if ((Get-Item -LiteralPath $blockmap).Length -eq 0) {
+            throw "Installer blockmap is empty: $blockmap"
+          }
+
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne 'NotSigned') {
+            throw "Unsigned build produced Authenticode status '$($signature.Status)'"
+          }
+
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $filename" | Set-Content -LiteralPath $hashes -Encoding utf8NoBOM
+
+          @(
+            "version=$version"
+            "installer=$installer"
+            "blockmap=$blockmap"
+            "hashes=$hashes"
+          ) | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $notes = "Unsigned Windows test build for commit $env:GITHUB_SHA.`n`nThis installer is for testing only and is not a production release."
+          gh release create $env:RELEASE_TAG `
+            --draft `
+            --latest=false `
+            --target $env:GITHUB_SHA `
+            --title "DeepSeek Harness $env:BUILD_VERSION (unsigned Windows x64)" `
+            --notes $notes
+
+      - name: Upload installer to draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          INSTALLER: ${{ steps.artifact.outputs.installer }}
+          BLOCKMAP: ${{ steps.artifact.outputs.blockmap }}
+          HASHES: ${{ steps.artifact.outputs.hashes }}
+        run: gh release upload $env:RELEASE_TAG $env:INSTALLER $env:BLOCKMAP $env:HASHES --clobber
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: gh release edit $env:RELEASE_TAG --draft=false --prerelease
+
+      - name: Remove temporary Desktop configuration
+        if: always()
+        run: >-
+          Remove-Item -LiteralPath apps/desktop/.env.windows
+          -Force -ErrorAction SilentlyContinue
