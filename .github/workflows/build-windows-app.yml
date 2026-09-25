@@ -46,6 +46,27 @@ jobs:
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
           /t REG_DWORD /f /v "AllowDevelopmentWithoutDevLicense" /d "1"
 
+      # LibreOffice's packaged Windows bootstrap is not long-path aware.
+      - name: Create short physical worktree
+        id: worktree
+        run: |
+          $driveRoot = [IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)
+          $path = Join-Path $driveRoot 'd'
+          if (Test-Path -LiteralPath $path) { throw "Short worktree path already exists: $path" }
+          git worktree add --detach $path $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to create the short worktree' }
+
+          $relativeBootstrap = @(
+            'apps', 'desktop', '.desktop-build', 'targets', 'win-x64', 'unsigned-artifacts',
+            'win-unpacked', 'resources', 'app.asar.unpacked', 'dsh', 'node_modules',
+            '@deepseek-ai', 'libreoffice-kit-win32-x64', 'program', 'program', '..', 'share',
+            'registry', 'res', 'fcfg_langpack_en-US.xcd'
+          ) -join '\'
+          $bootstrap = "$path\$relativeBootstrap"
+          Write-Host "Packaged LibreOffice bootstrap path length: $($bootstrap.Length)"
+          if ($bootstrap.Length -ge 240) { throw "Packaged LibreOffice bootstrap path is too long: $bootstrap" }
+          "path=$path" >> $env:GITHUB_OUTPUT
+
       - uses: pnpm/action-setup@v4
         with:
           dest: ${{ runner.temp }}/setup-pnpm-js-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
@@ -60,15 +81,18 @@ jobs:
           python-version: '3.10'
 
       - name: Install (immutable)
+        working-directory: ${{ steps.worktree.outputs.path }}
         run: pnpm install --frozen-lockfile
 
       - name: Validate workflow policy and Desktop documentation
+        working-directory: ${{ steps.worktree.outputs.path }}
         run: |
           pnpm exec vitest run scripts/ci-workflow.spec.ts
           pnpm run verify-translation-pairing apps/desktop/README.md
 
       - name: Resolve application version and release tag
         id: version
+        working-directory: ${{ steps.worktree.outputs.path }}
         env:
           REQUESTED_BUILD_VERSION: ${{ inputs.build_version }}
           REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
@@ -90,6 +114,7 @@ jobs:
           "tag=$tag" >> $env:GITHUB_OUTPUT
 
       - name: Configure unsigned packaging
+        working-directory: ${{ steps.worktree.outputs.path }}
         run: |
           @'
           DSH_DESKTOP_APP_ID=com.deepseek.harness
@@ -99,6 +124,7 @@ jobs:
           '@ | Set-Content -LiteralPath apps/desktop/.env.windows -Encoding utf8NoBOM
 
       - name: Build unsigned Windows installer
+        working-directory: ${{ steps.worktree.outputs.path }}
         env:
           BUILD_VERSION: ${{ steps.version.outputs.version }}
         run: >-
@@ -107,6 +133,7 @@ jobs:
 
       - name: Verify and hash installer
         id: artifact
+        working-directory: ${{ steps.worktree.outputs.path }}
         env:
           BUILD_VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -143,6 +170,7 @@ jobs:
           ) | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Create draft GitHub Release
+        working-directory: ${{ steps.worktree.outputs.path }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -158,6 +186,7 @@ jobs:
             --notes $notes
 
       - name: Upload installer to draft GitHub Release
+        working-directory: ${{ steps.worktree.outputs.path }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -168,6 +197,7 @@ jobs:
         run: gh release upload $env:RELEASE_TAG $env:INSTALLER $env:BLOCKMAP $env:HASHES --clobber
 
       - name: Publish GitHub Release
+        working-directory: ${{ steps.worktree.outputs.path }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -176,6 +206,7 @@ jobs:
 
       - name: Remove temporary Desktop configuration
         if: always()
+        working-directory: ${{ steps.worktree.outputs.path }}
         run: >-
           Remove-Item -LiteralPath apps/desktop/.env.windows
           -Force -ErrorAction SilentlyContinue

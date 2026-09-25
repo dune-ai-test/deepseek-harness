@@ -57,8 +57,11 @@ describe('CI workflow', () => {
     if (!Array.isArray(job.steps)) throw new TypeError('Windows app build job must define steps')
     const steps = job.steps.filter(isRecord)
     const stepIndex = (name: string): number => steps.findIndex(step => step.name === name)
+    const worktree = stepIndex('Create short physical worktree')
     const install = stepIndex('Install (immutable)')
     const workflowPolicy = stepIndex('Validate workflow policy and Desktop documentation')
+    const resolveVersion = stepIndex('Resolve application version and release tag')
+    const configure = stepIndex('Configure unsigned packaging')
     const packageInstaller = stepIndex('Build unsigned Windows installer')
     const verify = stepIndex('Verify and hash installer')
     const createDraft = stepIndex('Create draft GitHub Release')
@@ -70,14 +73,28 @@ describe('CI workflow', () => {
       uses: 'pnpm/action-setup@v4',
       with: { dest: nativeWindowsPnpmDestination },
     }))
-    expect(install).toBeGreaterThanOrEqual(0)
+    expect(worktree).toBeGreaterThanOrEqual(0)
+    expect(steps[worktree]).toMatchObject({ id: 'worktree' })
+    expect(steps[worktree]?.run).toContain('[IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)')
+    expect(steps[worktree]?.run).toContain('git worktree add --detach $path $env:GITHUB_SHA')
+    expect(steps[worktree]?.run).toContain('if ($bootstrap.Length -ge 240)')
+    expect(install).toBeGreaterThan(worktree)
     expect(workflowPolicy).toBeGreaterThan(install)
-    expect(packageInstaller).toBeGreaterThan(workflowPolicy)
+    expect(resolveVersion).toBeGreaterThan(workflowPolicy)
+    expect(configure).toBeGreaterThan(resolveVersion)
+    expect(packageInstaller).toBeGreaterThan(configure)
     expect(verify).toBeGreaterThan(packageInstaller)
     expect(createDraft).toBeGreaterThan(verify)
     expect(upload).toBeGreaterThan(createDraft)
     expect(publish).toBeGreaterThan(upload)
     expect(cleanup).toBeGreaterThan(publish)
+    const shortWorktreeSteps = [
+      install, workflowPolicy, resolveVersion, configure, packageInstaller,
+      verify, createDraft, upload, publish, cleanup,
+    ]
+    for (const index of shortWorktreeSteps) {
+      expect(steps[index]).toMatchObject({ 'working-directory': '${{ steps.worktree.outputs.path }}' })
+    }
     expect(steps[workflowPolicy]?.run).toContain('pnpm exec vitest run scripts/ci-workflow.spec.ts')
     expect(steps[workflowPolicy]?.run).toContain('pnpm run verify-translation-pairing apps/desktop/README.md')
     expect(steps[packageInstaller]?.run).toContain('pnpm run package:desktop:win:x64:unsigned')
