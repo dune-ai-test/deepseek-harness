@@ -78,20 +78,16 @@ describe('CI workflow', () => {
     expect(upload).toBeGreaterThan(createDraft)
     expect(publish).toBeGreaterThan(upload)
     expect(cleanup).toBeGreaterThan(publish)
-    expect(steps[workflowPolicy]).toMatchObject({
-      run: [
-        'pnpm exec vitest run scripts/ci-workflow.spec.ts',
-        'pnpm run verify-translation-pairing apps/desktop/README.md',
-      ].join('\n'),
-    })
-    expect(steps[packageInstaller].run).toContain('pnpm run package:desktop:win:x64:unsigned')
-    expect(steps[packageInstaller].run).toContain('--build-version "$env:BUILD_VERSION"')
-    expect(steps[verify].run).toContain('Get-AuthenticodeSignature')
-    expect(steps[verify].run).toContain("if ($signature.Status -ne 'NotSigned')")
-    expect(steps[createDraft].run).toContain('gh release create $env:RELEASE_TAG')
-    expect(steps[createDraft].run).toContain('--latest=false')
-    expect(steps[upload].run).toContain('gh release upload $env:RELEASE_TAG')
-    expect(steps[publish].run).toContain('gh release edit $env:RELEASE_TAG --draft=false --prerelease')
+    expect(steps[workflowPolicy]?.run).toContain('pnpm exec vitest run scripts/ci-workflow.spec.ts')
+    expect(steps[workflowPolicy]?.run).toContain('pnpm run verify-translation-pairing apps/desktop/README.md')
+    expect(steps[packageInstaller]?.run).toContain('pnpm run package:desktop:win:x64:unsigned')
+    expect(steps[packageInstaller]?.run).toContain('--build-version "$env:BUILD_VERSION"')
+    expect(steps[verify]?.run).toContain('Get-AuthenticodeSignature')
+    expect(steps[verify]?.run).toContain("if ($signature.Status -ne 'NotSigned')")
+    expect(steps[createDraft]?.run).toContain('gh release create $env:RELEASE_TAG')
+    expect(steps[createDraft]?.run).toContain('--latest=false')
+    expect(steps[upload]?.run).toContain('gh release upload $env:RELEASE_TAG')
+    expect(steps[publish]?.run).toContain('gh release edit $env:RELEASE_TAG --draft=false --prerelease')
     expect(steps[cleanup]).toMatchObject({ if: 'always()' })
     expect(steps.some(step => typeof step.uses === 'string' && step.uses.startsWith('actions/upload-artifact@'))).toBe(false)
   })
